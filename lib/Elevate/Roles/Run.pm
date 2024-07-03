@@ -64,8 +64,9 @@ sub ssystem ( $, @args ) {
 }
 
 sub ssystem_and_die ( $self, @args ) {
-    $self->ssystem(@args) or return 0;
-    die "command failed. Fix it and run command.";
+    my $sr = $self->ssystem( { should_return_sro => 1 }, @args );
+    LOGCROAK( $sr->to_exception() ) if $?;
+    return 0;
 }
 
 sub _ssystem ( $command, %opts ) {
@@ -113,6 +114,10 @@ sub _ssystem ( $command, %opts ) {
     if ( $opts{should_capture_output} ) {
         $capture_output->{status} = $?;
         return $capture_output;
+    }
+
+    if ( $opts{should_return_sro} ) {
+        return $sr;
     }
 
     return $?;

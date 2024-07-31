@@ -12,6 +12,7 @@ Blockers for datbase: MySQL, PostgreSQL...
 
 use cPstrict;
 
+use Elevate::Constants ();
 use Elevate::Database  ();
 use Elevate::StageFile ();
 
@@ -27,8 +28,6 @@ use Cpanel::MysqlUtils::MyCnf::Basic   ();
 use parent qw{Elevate::Blockers::Base};
 
 use Log::Log4perl qw(:easy);
-
-use constant POSTGRESQL_ACK_TOUCH_FILE => q[/var/cpanel/acknowledge_postgresql_for_elevate];
 
 sub check ($self) {
     my $ok = 1;
@@ -58,7 +57,7 @@ sub _blocker_acknowledge_postgresql_datadir ($self) {
 
     return 0 unless Cpanel::Pkgr::is_installed('postgresql-server');
 
-    my $touch_file = POSTGRESQL_ACK_TOUCH_FILE;
+    my $touch_file = Elevate::Constants::POSTGRESQL_ACK_TOUCH_FILE;
     return 0 if -e $touch_file;
 
     my @users_with_dbs = $self->_has_mapped_postgresql_dbs();

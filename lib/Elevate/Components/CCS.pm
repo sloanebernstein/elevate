@@ -25,6 +25,7 @@ use Cpanel::Config::Users ();
 use Cpanel::JSON          ();
 use Cpanel::Pkgr          ();
 
+use Elevate::Constants ();
 use Elevate::Notify    ();
 use Elevate::StageFile ();
 
@@ -81,42 +82,53 @@ sub remove_cpanel_ccs_home_directory ($self) {
 
 =head1 move_pgsql_directory
 
-Removing the PKG will leave this directory in place
-This results in PostGreSQL/CCS failing to start after leapp completes
+Due to the fact that CCS re-uses scripts originally intended for use with the
+system Postgres, leaving the system Postgres data directory in place sometimes
+results in failure to apply schema updates to CCS, causing failures in
+importing user data. This is technically a bug in CCS, but we will not be
+issuing a fix for that. Instead, when needed, the system Postgres database
+shall be moved aside, ensuring that all and only CCS processes apply to that
+instance of Postgres.
 
 =cut
 
 sub move_pgsql_directory ($self) {
-    my $pg_dir        = '/var/lib/pgsql';
-    my $pg_backup_dir = '/var/lib/pgsql_pre_elevate';
+    my $pg_dir             = '/var/lib/pgsql';
+    my $pg_backup_dir_base = '/var/lib/pgsql_pre_elevate';
 
-    # Remove the backup path if it exists as a directory
-    File::Path::remove_tree($pg_backup_dir) if -e $pg_backup_dir && -d $pg_backup_dir;
+    return unless -d $pg_dir;
 
-    # If we were unable to remove the backup path above, then change it to something that
-    # should be unique
-    $pg_backup_dir .= '_' . time() . '_' . $$ if -e $pg_backup_dir;
-
-    # Make sure the path that should be unique does not exist
-    File::Path::remove_tree($pg_backup_dir) if -e $pg_backup_dir && -d $pg_backup_dir;
-
-    # Give it up if we still do not have a candidate to back the data up to
-    if ( -e $pg_backup_dir ) {
-        die <<~"EOS";
+    my $pg_backup_dir = $pg_backup_dir_base . '_' . time() . '_' . $$;
+    if ( -e $pg_backup_dir ) {    # This should never happen anymore, since we always use timestamps + PID.
+        LOGDIE( <<~"EOS" );
         Unable to ensure a valid backup path for $pg_dir.
-        Please ensure that '/var/lib/pgsql_pre_elevate' does not exist on your system and execute this script again with
+        Please ensure that '$pg_backup_dir' does not exist on your system and execute this script again with
 
         /scripts/elevate-cpanel --continue
 
         EOS
     }
 
-    INFO( <<~"EOS" );
+    Elevate::StageFile::update_stage_file( { pg_backup_dir => $pg_backup_dir } );
+
+    WARN( <<~"EOS" );
     Moving the PostgreSQL data dir located at $pg_dir to $pg_backup_dir
-    to ensure a functioning PostgreSQL server after the elevation completes.
+    due to issues with the CCS upgrade process. This script will attempt to move the directory
+    back to $pg_dir after CCS is upgraded.
     EOS
 
-    File::Copy::move( $pg_dir, $pg_backup_dir ) if -d $pg_dir;
+    my $result = File::Copy::move( $pg_dir, $pg_backup_dir );
+    LOGDIE(qq[The system failed to move $pg_dir to $pg_backup_dir (reason: $!)!]) if !$result;
+
+    # If there's a datadir but no Postgres touch file, this is the notification:
+    if ( !-e Elevate::Constants::POSTGRESQL_ACK_TOUCH_FILE ) {
+        Elevate::Notify::add_final_notification( <<~"EOS" );
+        An existing PostgreSQL data directory at $pg_dir has been moved
+        to $pg_backup_dir. cPanel did not report any active users of PostgreSQL.
+        If this is not correct, restore the old data directory and upgrade it for
+        the new version of PostgreSQL installed on your system.
+        EOS
+    }
 
     return;
 }
@@ -334,6 +346,8 @@ sub post_leapp ($self) {
     $self->_ensure_ccs_service_is_up();
     $self->run_once('import_ccs_data');
 
+    $self->move_pgsql_directory_back();
+
     return;
 }
 
@@ -455,6 +469,63 @@ sub _import_data_for_single_user ( $self, $user ) {
         die "CCS import failed for $user\n";
     };
 
+    return;
+}
+
+# Nothing about this process is mandatory, so if there is an error, the ELevate
+# process will be allowed to continue.
+sub move_pgsql_directory_back ($self) {
+
+    # If there's no touch file, assume there's nothing worth restoring,
+    # and we already told them about the move previously:
+    return unless -e Elevate::Constants::POSTGRESQL_ACK_TOUCH_FILE;
+
+    # If there isn't a recorded backup dir, something went wrong:
+    my $pg_dir        = '/var/lib/pgsql';
+    my $pg_backup_dir = Elevate::StageFile::read_stage_file( 'pg_backup_dir', '' );
+    if ( !$pg_backup_dir ) {
+        my $msg = <<~"EOS";
+        ELevate lost track of the PostgreSQL backup directory it made. This should not have occurred.
+        See the ELevate log for information about its location, then restore this directory
+        to $pg_dir and perform the update as recommended.
+        EOS
+
+        ERROR($msg);
+        Elevate::Notify::add_final_notification($msg);
+        return;
+    }
+
+    INFO(qq[Restoring system PostgreSQL instance...]);
+
+    Elevate::SystemctlService->new( name => 'postgresql' )->stop();    # just in case
+    File::Path::remove_tree($pg_dir) if -e $pg_dir;
+
+    # If there's still something there, something is wrong:
+    if ( -e $pg_dir ) {
+        my $msg = <<~"EOS";
+        The system could not remove the empty placeholder PostgreSQL data directory at $pg_dir.
+        Remove this, restore the old instance from $pg_backup_dir manually, and perform
+        the update as recommended.
+        EOS
+
+        ERROR($msg);
+        Elevate::Notify::add_final_notification($msg);
+        return;
+    }
+
+    my $result = File::Copy::move( $pg_backup_dir, $pg_dir );
+    if ( !$result ) {
+        my $msg = <<~"EOS";
+        The system could not fully restore $pg_backup_dir to $pg_dir (reason: $!).
+        Restore this manually, and perform the update as recommended.
+        EOS
+
+        ERROR($msg);
+        Elevate::Notify::add_final_notification($msg);
+        return;
+    }
+
+    INFO(qq[The system returned the PostgreSQL data directory to $pg_dir.]);
     return;
 }
 

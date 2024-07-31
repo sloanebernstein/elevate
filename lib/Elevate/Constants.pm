@@ -52,4 +52,6 @@ use constant R1SOFT_AGENT_PACKAGES => qw{
   serverbackup-setup
 };
 
+use constant POSTGRESQL_ACK_TOUCH_FILE => q[/var/cpanel/acknowledge_postgresql_for_elevate];
+
 1;

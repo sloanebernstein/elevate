@@ -81,7 +81,7 @@ sub _perform_config_workaround ($self) {
 # TODO: error handling?
 sub _perform_postgresql_upgrade ($self) {
     INFO("Installing PostgreSQL update package:");
-    $self->dnf->install('postgresql-update');
+    $self->dnf->install('postgresql-upgrade');
 
     INFO("Upgrading PostgreSQL data directory:");
     $self->ssystem(qw{/usr/bin/postgresql-setup --upgrade});

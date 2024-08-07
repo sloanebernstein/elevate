@@ -53,6 +53,7 @@ BEGIN {    # Suppress load of all of these at earliest point.
     $INC{'Elevate/Components/NixStats.pm'}           = 'script/elevate-cpanel.PL.static';
     $INC{'Elevate/Components/PECL.pm'}               = 'script/elevate-cpanel.PL.static';
     $INC{'Elevate/Components/PerlXS.pm'}             = 'script/elevate-cpanel.PL.static';
+    $INC{'Elevate/Components/PostgreSQL.pm'}         = 'script/elevate-cpanel.PL.static';
     $INC{'Elevate/Components/UnconvertedModules.pm'} = 'script/elevate-cpanel.PL.static';
     $INC{'Elevate/Components/Repositories.pm'}       = 'script/elevate-cpanel.PL.static';
     $INC{'Elevate/Components/RpmDB.pm'}              = 'script/elevate-cpanel.PL.static';
@@ -129,6 +130,8 @@ BEGIN {    # Suppress load of all of these at earliest point.
       serverbackup-enterprise-agent
       serverbackup-setup
     };
+
+    use constant POSTGRESQL_SYSTEM_DATADIR => '/var/lib/pgsql/data';
 
     1;
 
@@ -612,82 +615,12 @@ BEGIN {    # Suppress load of all of these at earliest point.
     # use Log::Log4perl qw(:easy);
     INIT { Log::Log4perl->import(qw{:easy}); }
 
-    use constant POSTGRESQL_ACK_TOUCH_FILE => q[/var/cpanel/acknowledge_postgresql_for_elevate];
-
     sub check ($self) {
         my $ok = 1;
-        $self->_warning_if_postgresql_installed;
-        $ok = 0 unless $self->_blocker_acknowledge_postgresql_datadir;
         $ok = 0 unless $self->_blocker_old_mysql;
         $ok = 0 unless $self->_blocker_mysql_upgrade_in_progress;
         $self->_warning_mysql_not_enabled();
         return $ok;
-    }
-
-    sub _warning_if_postgresql_installed ($self) {
-        return 0 unless Cpanel::Pkgr::is_installed('postgresql-server');
-
-        my $pg_full_ver = Cpanel::Pkgr::get_package_version('postgresql-server');
-        my ($old_version) = $pg_full_ver =~ m/^(\d+\.\d+)/a;
-        return 1 if !$old_version || $old_version >= 10;
-
-        my $pretty_distro_name = $self->upgrade_to_pretty_name();
-        WARN("You have postgresql-server version $old_version installed. This will be upgraded irreversibly to version 10.0 when you switch to $pretty_distro_name");
-
-        return 2;
-    }
-
-    sub _blocker_acknowledge_postgresql_datadir ($self) {
-
-        return 0 unless Cpanel::Pkgr::is_installed('postgresql-server');
-
-        my $touch_file = POSTGRESQL_ACK_TOUCH_FILE;
-        return 0 if -e $touch_file;
-
-        my @users_with_dbs = $self->_has_mapped_postgresql_dbs();
-        return 0 unless scalar @users_with_dbs;
-
-        my $message = <<~"EOS";
-    One or more users on your system have associated PostgreSQL databases.
-    ELevate may upgrade the software packages associated with PostgreSQL
-    automatically, but if it does, it will *NOT* automatically update the
-    PostgreSQL data directory to work with the new version. Without an update
-    to the data directory, the upgraded PostgreSQL software will not start, in
-    order to ensure that your data does not become corrupted.
-
-    For more information about PostgreSQL upgrades, please consider the
-    following resources:
-
-    https://cpanel.github.io/elevate/blockers/#postgresql
-    https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/deploying_different_types_of_servers/using-databases#migrating-to-a-rhel-8-version-of-postgresql_using-postgresql
-    https://www.postgresql.org/docs/10/pgupgrade.html
-
-    When you are ready to acknowledge that you have prepared to update the
-    PostgreSQL data directory, or that this warning does not apply to you,
-    please touch the following file to continue with the ELevate process:
-
-    > touch $touch_file
-
-    The following user(s) have PostgreSQL databases associated with their cPanel accounts:
-    EOS
-
-        $message .= join "\n", sort(@users_with_dbs);
-
-        return $self->has_blocker($message);
-    }
-
-    sub _has_mapped_postgresql_dbs ($self) {
-
-        my $dbindex = eval { Cpanel::DB::Map::Collection::Index->new( { db => 'PGSQL' } ); };
-        if ( my $exception = $@ ) {
-            ERROR( 'Unable to read the database index file:  ' . Cpanel::Exception::get_string($exception) );
-            $self->has_blocker("Unable to read the database index file; you may need to rebuild it by running: /usr/local/cpanel/bin/dbindex");
-            return ();
-        }
-
-        my %user_hash = map { $dbindex->{dbindex}{$_} => 1 } keys %{ $dbindex->{dbindex} };
-
-        return ( keys %user_hash );
     }
 
     sub _blocker_old_mysql ($self) {
@@ -2803,7 +2736,6 @@ EOS
     }
 
     sub clean_up_pkg_cruft ($self) {
-        $self->move_pgsql_directory();
         $self->remove_cpanel_ccs_home_directory();
         return;
     }
@@ -2813,47 +2745,12 @@ EOS
         return;
     }
 
-    sub move_pgsql_directory ($self) {
-        my $pg_dir        = '/var/lib/pgsql';
-        my $pg_backup_dir = '/var/lib/pgsql_pre_elevate';
-
-        File::Path::remove_tree($pg_backup_dir) if -e $pg_backup_dir && -d $pg_backup_dir;
-
-        $pg_backup_dir .= '_' . time() . '_' . $$ if -e $pg_backup_dir;
-
-        File::Path::remove_tree($pg_backup_dir) if -e $pg_backup_dir && -d $pg_backup_dir;
-
-        if ( -e $pg_backup_dir ) {
-            die <<~"EOS";
-        Unable to ensure a valid backup path for $pg_dir.
-        Please ensure that '/var/lib/pgsql_pre_elevate' does not exist on your system and execute this script again with
-
-        /scripts/elevate-cpanel --continue
-
-        EOS
-        }
-
-        INFO( <<~"EOS" );
-    Moving the PostgreSQL data dir located at $pg_dir to $pg_backup_dir
-    to ensure a functioning PostgreSQL server after the elevation completes.
-    EOS
-
-        File::Copy::move( $pg_dir, $pg_backup_dir ) if -d $pg_dir;
-
-        return;
-    }
-
     sub remove_ccs_and_dependencies ($self) {
 
         my $zpush_installed = Cpanel::Pkgr::is_installed(ZPUSH_PACKAGE);
         Elevate::StageFile::update_stage_file( { zpush_installed => $zpush_installed } );
 
-        my @ccs_dependencies = qw{
-          postgresql
-          postgresql-devel
-          postgresql-server
-        };
-
+        my @ccs_dependencies;
         push @ccs_dependencies, ZPUSH_PACKAGE();
 
         $self->yum->remove( CCS_PACKAGE(), @ccs_dependencies );
@@ -3021,12 +2918,16 @@ EOS
     sub post_leapp ($self) {
         return unless Elevate::StageFile::read_stage_file('ccs_installed');
 
+        $self->run_once('move_pgsql_directory');
+
         $self->_install_ccs_and_dependencies();
 
         $self->_clear_task_queue();
 
         $self->_ensure_ccs_service_is_up();
         $self->run_once('import_ccs_data');
+
+        $self->move_pgsql_directory_back();
 
         return;
     }
@@ -3142,6 +3043,52 @@ EOS
             die "CCS import failed for $user\n";
         };
 
+        return;
+    }
+
+    sub move_pgsql_directory ($self) {
+        my $pg_dir        = '/var/lib/pgsql';
+        my $pg_backup_dir = '/var/lib/pgsql_pre_elevate';
+
+        return unless -d $pg_dir;
+
+        File::Path::remove_tree($pg_backup_dir) if -e $pg_backup_dir && -d $pg_backup_dir;
+
+        INFO( <<~"EOS" );
+    Temporarily moving the PostgreSQL data dir located at $pg_dir to $pg_backup_dir
+    due to issues with the CCS upgrade process. This script will attempt to move the directory
+    back to $pg_dir after CCS is upgraded.
+    EOS
+
+        my $success = rename( $pg_dir, $pg_backup_dir );
+        LOGDIE(qq[The system failed to move $pg_dir to $pg_backup_dir (reason: $!)!]) unless $success;
+
+        return;
+    }
+
+    sub move_pgsql_directory_back ($self) {
+        my $pg_dir        = '/var/lib/pgsql';
+        my $pg_backup_dir = '/var/lib/pgsql_pre_elevate';
+
+        return unless -e $pg_backup_dir;
+
+        INFO(qq[Restoring system PostgreSQL instance...]);
+
+        Elevate::SystemctlService->new( name => 'postgresql' )->stop();    # just in case
+        File::Path::remove_tree($pg_dir) if -e $pg_dir;
+
+        my $result = rename( $pg_backup_dir, $pg_dir );
+        if ( !$result ) {
+            my $msg = <<~"EOS";
+        The system could not fully restore $pg_backup_dir to $pg_dir (reason: $!).
+        Restore this manually, and perform the update as recommended.
+        EOS
+
+            LOGDIE($msg);
+            return;
+        }
+
+        INFO(qq[The system returned the PostgreSQL data directory to $pg_dir.]);
         return;
     }
 
@@ -5111,6 +5058,98 @@ EOS
     1;
 
 }    # --- END lib/Elevate/Components/PerlXS.pm
+
+{    # --- BEGIN lib/Elevate/Components/PostgreSQL.pm
+
+    package Elevate::Components::PostgreSQL;
+
+    use cPstrict;
+
+    # use Elevate::Components::Base();
+    our @ISA;
+    BEGIN { push @ISA, qw(Elevate::Components::Base); }
+
+    use Elevate::Constants ();
+
+    use Cpanel::Pkgr       ();
+    use Whostmgr::Postgres ();
+
+    # use Log::Log4perl qw(:easy);
+    INIT { Log::Log4perl->import(qw{:easy}); }
+
+    use File::Copy::Recursive ();
+    use File::Slurp           ();
+
+    sub pre_leapp ($self) {
+        if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
+            $self->_backup_postgresql_datadir();
+        }
+
+        return;
+    }
+
+    sub _backup_postgresql_datadir ($self) {
+        my $pgsql_datadir_path        = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR;
+        my $pgsql_datadir_backup_path = $pgsql_datadir_path . '_' . time() . '_' . $$;
+
+        INFO("Backing up the system PostgreSQL data directory at $pgsql_datadir_path to $pgsql_datadir_backup_path.");
+
+        my ( $uid, $gid ) = ( scalar( getpwnam('postgres') ), scalar( getgrnam('postgres') ) );
+        local ( $>, $) ) = ( $uid, "$gid $gid" );
+
+        File::Copy::Recursive::dircopy( $pgsql_datadir_path, $pgsql_datadir_backup_path );
+
+        return;
+    }
+
+    sub post_leapp ($self) {
+        if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
+            $self->_perform_config_workaround();
+            $self->_perform_postgresql_upgrade();
+            $self->_run_whostmgr_postgres_update_config();
+        }
+
+        return;
+    }
+
+    sub _perform_config_workaround ($self) {
+        my $pgconf_path = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf';
+        my $pgconf      = File::Slurper::read_text($pgconf_path);                               # TODO: what if this file does not exist?
+
+        INFO("Modifying $pgconf_path to work around a defect in the system's PostgreSQL upgrade package.");
+
+        my @lines = split "\n", $pgconf;
+        foreach my $line (@lines) {
+            next if $line =~ m/^\s*$/a;
+            $line = "#$line" if $line =~ m/^\s*unix_socket_directories/;
+        }
+
+        push @lines, "unix_socket_directory = '/var/run/postgresql'";
+
+        my $pgconf_altered = join "\n", @lines;
+        File::Slurper::write_text( $pgconf_path, $pgconf_altered );
+
+        return;
+    }
+
+    sub _perform_postgresql_upgrade ($self) {
+        INFO("Installing PostgreSQL update package:");
+        $self->dnf->install('postgresql-update');
+
+        INFO("Upgrading PostgreSQL data directory:");
+        $self->ssystem(qw{/usr/bin/postgresql-setup --upgrade});
+
+        return;
+    }
+
+    sub _run_whostmgr_postgres_update_config ($self) {
+        INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
+        return Whostmgr::Postgres::update_config();
+    }
+
+    1;
+
+}    # --- END lib/Elevate/Components/PostgreSQL.pm
 
 {    # --- BEGIN lib/Elevate/Components/UnconvertedModules.pm
 
@@ -8462,6 +8501,7 @@ use Elevate::Components::NICs               ();
 use Elevate::Components::NixStats           ();
 use Elevate::Components::PECL               ();
 use Elevate::Components::PerlXS             ();
+use Elevate::Components::PostgreSQL         ();
 use Elevate::Components::UnconvertedModules ();
 use Elevate::Components::Repositories       ();
 use Elevate::Components::RpmDB              ();
@@ -9503,6 +9543,7 @@ sub run_final_components_pre_leapp ($self) {
     # order matters
     $self->run_component_once( 'RmMod'            => 'pre_leapp' );
     $self->run_component_once( 'MySQL'            => 'pre_leapp' );
+    $self->run_component_once( 'PostgreSQL'       => 'pre_leapp' );
     $self->run_component_once( 'Repositories'     => 'pre_leapp' );
     $self->run_component_once( 'cPanelPlugins'    => 'pre_leapp' );
     $self->run_component_once( 'PerlXS'           => 'pre_leapp' );
@@ -9531,6 +9572,7 @@ sub post_leapp_update_restore ($self) {
     # plugins can use MySQL - restore database earlier
     $self->run_component_once( 'MySQL'           => 'post_leapp' );
     $self->run_component_once( 'PerlXS'          => 'post_leapp' );
+    $self->run_component_once( 'PostgreSQL'      => 'post_leapp' );
     $self->run_component_once( 'cPanelPlugins'   => 'post_leapp' );
     $self->run_component_once( 'DatabaseUpgrade' => 'post_leapp' );
     $self->run_component_once( 'PECL'            => 'post_leapp' );

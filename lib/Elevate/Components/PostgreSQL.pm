@@ -10,6 +10,8 @@ Elevate::Components::PostgreSQL
 
 use cPstrict;
 
+use Simple::Accessor qw{service};
+
 use parent qw{Elevate::Components::Base};
 
 use Elevate::Constants ();
@@ -22,9 +24,25 @@ use Log::Log4perl qw(:easy);
 use File::Copy::Recursive ();
 use File::Slurp           ();
 
+sub _build_service ($self) {
+    return Elevate::SystemctlService->new( name => 'postgresql' );
+}
+
 sub pre_leapp ($self) {
     if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
+        $self->_disable_postgresql_service();
         $self->_backup_postgresql_datadir();
+    }
+
+    return;
+}
+
+sub _disable_postgresql_service ($self) {
+
+    # If the service is enabled but unable to run, then upcp fails during post-leapp phase of the RpmDB component:
+    if ( $self->service->is_enabled ) {
+        Elevate::StageFile::update_stage_file( { 're-enable_postgresql_service' => 1 } );
+        $self->service->disable();
     }
 
     return;
@@ -33,6 +51,9 @@ sub pre_leapp ($self) {
 # TODO: What happens if this runs out of disk space? Other error checking too.
 # XXX Is this really better than `cp -a $src $dst`? I hope nothing in there is owned by someone other than the postgres user...
 sub _backup_postgresql_datadir ($self) {
+
+    $self->service->stop() if $self->service->is_active;    # for safety
+
     my $pgsql_datadir_path        = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR;
     my $pgsql_datadir_backup_path = $pgsql_datadir_path . '_' . time() . '_' . $$;
 
@@ -53,6 +74,7 @@ sub post_leapp ($self) {
         $self->_perform_config_workaround();
         $self->_perform_postgresql_upgrade();
         $self->_run_whostmgr_postgres_update_config();
+        $self->_re_enable_service_if_needed();
     }
 
     return;
@@ -95,6 +117,14 @@ sub _perform_postgresql_upgrade ($self) {
 sub _run_whostmgr_postgres_update_config ($self) {
     INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
     return Whostmgr::Postgres::update_config();
+}
+
+sub _re_enable_service_if_needed ($self) {
+    if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_service', 0 ) ) {
+        $self->service->enable();
+    }
+
+    return;
 }
 
 1;

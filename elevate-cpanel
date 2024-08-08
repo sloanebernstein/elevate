@@ -5065,6 +5065,8 @@ EOS
 
     use cPstrict;
 
+    use Simple::Accessor qw{service};
+
     # use Elevate::Components::Base();
     our @ISA;
     BEGIN { push @ISA, qw(Elevate::Components::Base); }
@@ -5080,15 +5082,33 @@ EOS
     use File::Copy::Recursive ();
     use File::Slurp           ();
 
+    sub _build_service ($self) {
+        return Elevate::SystemctlService->new( name => 'postgresql' );
+    }
+
     sub pre_leapp ($self) {
         if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
+            $self->_disable_postgresql_service();
             $self->_backup_postgresql_datadir();
         }
 
         return;
     }
 
+    sub _disable_postgresql_service ($self) {
+
+        if ( $self->service->is_enabled ) {
+            Elevate::StageFile::update_stage_file( { 're-enable_postgresql_service' => 1 } );
+            $self->service->disable();
+        }
+
+        return;
+    }
+
     sub _backup_postgresql_datadir ($self) {
+
+        $self->service->stop() if $self->service->is_active;    # for safety
+
         my $pgsql_datadir_path        = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR;
         my $pgsql_datadir_backup_path = $pgsql_datadir_path . '_' . time() . '_' . $$;
 
@@ -5107,6 +5127,7 @@ EOS
             $self->_perform_config_workaround();
             $self->_perform_postgresql_upgrade();
             $self->_run_whostmgr_postgres_update_config();
+            $self->_re_enable_service_if_needed();
         }
 
         return;
@@ -5145,6 +5166,14 @@ EOS
     sub _run_whostmgr_postgres_update_config ($self) {
         INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
         return Whostmgr::Postgres::update_config();
+    }
+
+    sub _re_enable_service_if_needed ($self) {
+        if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_service', 0 ) ) {
+            $self->service->enable();
+        }
+
+        return;
     }
 
     1;
@@ -7904,6 +7933,20 @@ EOS
         my $now = $opts{'now'} // 1;    # by default disable it now...
 
         my @args = qw{ disable };
+        push @args, '--now' if $now;
+
+        $self->ssystem( '/usr/bin/systemctl', @args, $self->name );
+
+        return;
+    }
+
+    sub enable ( $self, %opts ) {
+
+        return if $self->is_enabled;
+
+        my $now = $opts{'now'} // 1;    # by default enable it now...
+
+        my @args = qw{ enable };
         push @args, '--now' if $now;
 
         $self->ssystem( '/usr/bin/systemctl', @args, $self->name );

@@ -106,4 +106,18 @@ sub disable ( $self, %opts ) {
     return;
 }
 
+sub enable ( $self, %opts ) {
+
+    return if $self->is_enabled;
+
+    my $now = $opts{'now'} // 1;    # by default enable it now...
+
+    my @args = qw{ enable };
+    push @args, '--now' if $now;
+
+    $self->ssystem( '/usr/bin/systemctl', @args, $self->name );
+
+    return;
+}
+
 1;

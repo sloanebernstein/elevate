@@ -83,6 +83,15 @@ sub remove ($self) {
     return;
 }
 
+sub start ($self) {
+
+    return if $self->is_active;
+
+    $self->ssystem( '/usr/bin/systemctl', 'start', $self->name );
+
+    return;
+}
+
 sub stop ($self) {
 
     return unless $self->is_active;

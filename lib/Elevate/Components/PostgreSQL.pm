@@ -73,8 +73,8 @@ sub post_leapp ($self) {
     if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
         $self->_perform_config_workaround();
         $self->_perform_postgresql_upgrade();
-        $self->_run_whostmgr_postgres_update_config();
         $self->_re_enable_service_if_needed();
+        $self->_run_whostmgr_postgres_update_config();
     }
 
     return;
@@ -116,6 +116,7 @@ sub _perform_postgresql_upgrade ($self) {
 # TODO: return values
 sub _run_whostmgr_postgres_update_config ($self) {
     INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
+    $self->service->start();    # PostgreSQL *must* be online for this to work
     return Whostmgr::Postgres::update_config();
 }
 

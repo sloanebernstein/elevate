@@ -5073,8 +5073,9 @@ EOS
 
     use Elevate::Constants ();
 
-    use Cpanel::Pkgr       ();
-    use Whostmgr::Postgres ();
+    use Cpanel::Pkgr              ();
+    use Cpanel::Services::Enabled ();
+    use Whostmgr::Postgres        ();
 
     # use Log::Log4perl qw(:easy);
     INIT { Log::Log4perl->import(qw{:easy}); }
@@ -5099,6 +5100,7 @@ EOS
 
         if ( $self->service->is_enabled ) {
             Elevate::StageFile::update_stage_file( { 're-enable_postgresql_service' => 1 } );
+            Cpanel::Services::Enabled::touch_disable_file('postgresql');
             $self->service->disable();
         }
 
@@ -5171,6 +5173,7 @@ EOS
 
     sub _re_enable_service_if_needed ($self) {
         if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_service', 0 ) ) {
+            Cpanel::Services::Enabled::remove_disable_files('postgresql');
             $self->service->enable();
         }
 

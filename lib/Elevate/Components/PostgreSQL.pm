@@ -16,8 +16,9 @@ use parent qw{Elevate::Components::Base};
 
 use Elevate::Constants ();
 
-use Cpanel::Pkgr       ();
-use Whostmgr::Postgres ();
+use Cpanel::Pkgr              ();
+use Cpanel::Services::Enabled ();
+use Whostmgr::Postgres        ();
 
 use Log::Log4perl qw(:easy);
 
@@ -42,6 +43,7 @@ sub _disable_postgresql_service ($self) {
     # If the service is enabled but unable to run, then upcp fails during post-leapp phase of the RpmDB component:
     if ( $self->service->is_enabled ) {
         Elevate::StageFile::update_stage_file( { 're-enable_postgresql_service' => 1 } );
+        Cpanel::Services::Enabled::touch_disable_file('postgresql');
         $self->service->disable();
     }
 
@@ -122,6 +124,7 @@ sub _run_whostmgr_postgres_update_config ($self) {
 
 sub _re_enable_service_if_needed ($self) {
     if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_service', 0 ) ) {
+        Cpanel::Services::Enabled::remove_disable_files('postgresql');
         $self->service->enable();
     }
 

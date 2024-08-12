@@ -52,7 +52,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
 
     if ( $self->service->is_active ) {
         my $psql_sro = Cpanel::SafeRun::Object->new_or_die(
-            program => Cpanel::Binaries::path('psql'),
+            program => '/usr/bin/psql',
             args    => [
                 qw{-F | -At -U postgres -c},
                 q{SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_catalog.pg_database WHERE datname = 'template1'},
@@ -60,6 +60,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
         );
 
         my $output = $psql_sro->stdout;
+        DEBUG($output);
         chomp $output;
 
         my ( $encoding, $collation, $ctype ) = split '|', $output;

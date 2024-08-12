@@ -29,8 +29,11 @@ sub _build_service ($self) {
     return Elevate::SystemctlService->new( name => 'postgresql' );
 }
 
+# installed
+
 sub pre_leapp ($self) {
     if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
+        $self->_store_postgresql_encoding_and_locale();
         $self->_disable_postgresql_service();
         $self->_backup_postgresql_datadir();
     }
@@ -38,13 +41,53 @@ sub pre_leapp ($self) {
     return;
 }
 
+# PostgreSQL needs to be up to get this information:
+sub _store_postgresql_encoding_and_locale ($self) {
+
+    return if $self->_gave_up_on_postgresql;    # won't hurt
+
+    my $is_active_prior = $self->service->is_active;
+
+    $self->service->start();                    # short-circuits if already active
+
+    if ( $self->service->is_active ) {
+        my $psql_sro = Cpanel::SafeRun::Object->new_or_die(
+            program => Cpanel::Binaries::path('psql'),
+            args    => [
+                qw{-F | -At -U postgres -c},
+                q{SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_catalog.pg_database WHERE datname = 'template1'},
+            ],
+        );
+
+        my $output = $psql_sro->stdout;
+        chomp $output;
+
+        my ( $encoding, $collation, $ctype ) = split '|', $output;
+        Elevate::StageFile::update_stage_file(
+            {
+                postgresql_locale => {
+                    encoding  => $encoding,
+                    collation => $collation,
+                    ctype     => $ctype,
+                }
+            }
+        );
+
+        $self->service_stop() unless $is_active_prior;
+    }
+    else {
+        $self->_give_up_on_postgresql();
+    }
+
+    return;
+}
+
 sub _disable_postgresql_service ($self) {
 
-    # If the service is enabled but unable to run, then upcp fails during post-leapp phase of the RpmDB component:
-    if ( $self->service->is_enabled ) {
-        Elevate::StageFile::update_stage_file( { 're-enable_postgresql_service' => 1 } );
+    # If the service is enabled in Service Manager but unable to run, then upcp fails during post-leapp phase of the RpmDB component:
+    if ( Cpanel::Services::Enabled::is_enabled('postgresql') ) {
+        Elevate::StageFile::update_stage_file( { 're-enable_postgresql_in_sm' => 1 } );
         Cpanel::Services::Enabled::touch_disable_file('postgresql');
-        $self->service->disable();
     }
 
     return;
@@ -83,6 +126,8 @@ sub post_leapp ($self) {
 }
 
 sub _perform_config_workaround ($self) {
+    return if $self->_gave_up_on_postgresql;
+
     my $pgconf_path = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf';
     my $pgconf      = File::Slurper::read_text($pgconf_path);                               # TODO: what if this file does not exist?
 
@@ -104,11 +149,21 @@ sub _perform_config_workaround ($self) {
 
 # TODO: error handling?
 sub _perform_postgresql_upgrade ($self) {
+    return if $self->_gave_up_on_postgresql;
+
     INFO("Installing PostgreSQL update package:");
     $self->dnf->install('postgresql-upgrade');
 
+    my $opts = Elevate::StageFile::read_stage_file('postgresql_locale');
+    my @args;
+    push @args, "--encoding=$opts->{encoding}"    if $opts->{encoding};
+    push @args, "--lc-collate=$opts->{collation}" if $opts->{collation};
+    push @args, "--lc-ctype=$opts->{ctype}"       if $opts->{ctype};
+
+    local $ENV{PGSETUP_INITDB_OPTIONS} = join ' ', @args if scalar @args > 0;
+
     INFO("Upgrading PostgreSQL data directory:");
-    $self->ssystem(qw{/usr/bin/postgresql-setup --upgrade});
+    my $capture = $self->ssystem_capture_output( { keep_env => 1 }, qw{/usr/bin/postgresql-setup --upgrade} );
 
     # TODO: add final notification stating that custom configuration and authentication may need to be restored manually
 
@@ -117,18 +172,35 @@ sub _perform_postgresql_upgrade ($self) {
 
 # TODO: return values
 sub _run_whostmgr_postgres_update_config ($self) {
+    return if $self->_gave_up_on_postgresql;
+
     INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
     $self->service->start();    # PostgreSQL *must* be online for this to work
     return Whostmgr::Postgres::update_config();
 }
 
 sub _re_enable_service_if_needed ($self) {
-    if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_service', 0 ) ) {
+    return if $self->_gave_up_on_postgresql;
+
+    if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_in_sm', 0 ) ) {
         Cpanel::Services::Enabled::remove_disable_files('postgresql');
-        $self->service->enable();
     }
 
     return;
+}
+
+sub _give_up_on_postgresql ($self) {
+    Elevate::StageFile::update_stage_file( { postgresql_give_up => 1 } );
+    return;
+}
+
+sub _gave_up_on_postgresql ($self) {
+    return Elevate::StageFile::read_stage_file( 'postgresql_give_up', 0 );
+}
+
+# alias
+sub _given_up_on_postgresql {
+    goto &_gave_up_on_postgresql;
 }
 
 1;

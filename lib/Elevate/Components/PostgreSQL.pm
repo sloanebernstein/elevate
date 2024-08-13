@@ -14,9 +14,12 @@ use Simple::Accessor qw{service};
 
 use parent qw{Elevate::Components::Base};
 
-use Elevate::Constants ();
+use Elevate::Constants        ();
+use Elevate::StageFile        ();
+use Elevate::SystemctlService ();
 
 use Cpanel::Pkgr              ();
+use Cpanel::SafeRun::Object   ();
 use Cpanel::Services::Enabled ();
 use Whostmgr::Postgres        ();
 
@@ -51,7 +54,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
     $self->service->start();                    # short-circuits if already active
 
     if ( $self->service->is_active ) {
-        my $psql_sro = Cpanel::SafeRun::Object->new_or_die(
+        my $psql_sro = Cpanel::SafeRun::Object->new(
             program => '/usr/bin/psql',
             args    => [
                 qw{-F | -At -U postgres -c},
@@ -59,11 +62,16 @@ sub _store_postgresql_encoding_and_locale ($self) {
             ],
         );
 
+        if ( $psql_sro->CHILD_ERROR ) {
+            ERROR("The system instance of PostgreSQL did not return information about the encoding and locale of core databases.");
+            $self->_give_up_on_postgresql();
+            return;
+        }
+
         my $output = $psql_sro->stdout;
-        DEBUG($output);
         chomp $output;
 
-        my ( $encoding, $collation, $ctype ) = split '|', $output;
+        my ( $encoding, $collation, $ctype ) = split /\|/, $output;
         Elevate::StageFile::update_stage_file(
             {
                 postgresql_locale => {
@@ -77,6 +85,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
         $self->service_stop() unless $is_active_prior;
     }
     else {
+        ERROR("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
         $self->_give_up_on_postgresql();
     }
 
@@ -85,7 +94,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
 
 sub _disable_postgresql_service ($self) {
 
-    # If the service is enabled in Service Manager but unable to run, then upcp fails during post-leapp phase of the RpmDB component:
+    # If the service is enabled in Service Manager, then upcp fails during post-leapp phase of the RpmDB component:
     if ( Cpanel::Services::Enabled::is_enabled('postgresql') ) {
         Elevate::StageFile::update_stage_file( { 're-enable_postgresql_in_sm' => 1 } );
         Cpanel::Services::Enabled::touch_disable_file('postgresql');
@@ -101,16 +110,24 @@ sub _backup_postgresql_datadir ($self) {
     $self->service->stop() if $self->service->is_active;    # for safety
 
     my $pgsql_datadir_path        = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR;
-    my $pgsql_datadir_backup_path = $pgsql_datadir_path . '_' . time() . '_' . $$;
+    my $pgsql_datadir_backup_path = $pgsql_datadir_path . '_elevate_' . time() . '_' . $$;
 
     # TODO: add final notification elaborating on this
     INFO("Backing up the system PostgreSQL data directory at $pgsql_datadir_path to $pgsql_datadir_backup_path.");
 
     # Set EUID/EGID to postgres for the rest of this function (this is not security critical; it's just to retain correct ownership within copy):
     my ( $uid, $gid ) = ( scalar( getpwnam('postgres') ), scalar( getgrnam('postgres') ) );
-    local ( $>, $) ) = ( $uid, "$gid $gid" );
 
-    File::Copy::Recursive::dircopy( $pgsql_datadir_path, $pgsql_datadir_backup_path );
+    my $outcome = 0;
+    {
+        local ( $>, $) ) = ( $uid, "$gid $gid" );
+        $outcome = File::Copy::Recursive::dircopy( $pgsql_datadir_path, $pgsql_datadir_backup_path );
+    }
+
+    if ( !$outcome ) {
+        ERROR("The system encountered an error while trying to make a backup.");
+        $self->_give_up_on_postgresql();
+    }
 
     return;
 }
@@ -130,20 +147,38 @@ sub _perform_config_workaround ($self) {
     return if $self->_gave_up_on_postgresql;
 
     my $pgconf_path = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf';
-    my $pgconf      = File::Slurper::read_text($pgconf_path);                               # TODO: what if this file does not exist?
+    return unless -e $pgconf_path;    # if postgresql.conf isn't there, there's nothing to work around
 
     INFO("Modifying $pgconf_path to work around a defect in the system's PostgreSQL upgrade package.");
 
-    my @lines = split "\n", $pgconf;
-    foreach my $line (@lines) {
-        next if $line =~ m/^\s*$/a;
-        $line = "#$line" if $line =~ m/^\s*unix_socket_directories/;
+    my $pgconf = eval { File::Slurper::read_text($pgconf_path) };
+    if ($@) {
+        ERROR("Attempting to read $pgconf_path resulted in an error: $@");
+        $self->_give_up_on_postgresql();
+        return;
     }
 
-    push @lines, "unix_socket_directory = '/var/run/postgresql'";
+    my $changed = 0;
+    my @lines   = split "\n", $pgconf;
+    foreach my $line (@lines) {
+        next if $line =~ m/^\s*$/a;
+        if ( $line =~ m/^\s*unix_socket_directories/ ) {
+            $line    = "#$line";
+            $changed = 1;
+        }
+    }
 
-    my $pgconf_altered = join "\n", @lines;
-    File::Slurper::write_text( $pgconf_path, $pgconf_altered );
+    if ($changed) {
+        push @lines, "unix_socket_directory = '/var/run/postgresql'";
+
+        my $pgconf_altered = join "\n", @lines;
+        eval { File::Slurper::write_text( $pgconf_path, $pgconf_altered ) };
+
+        if ($@) {
+            ERROR("Attempting to overwrite $pgconf_path resulted in an error: $@");
+            $self->_give_up_on_postgresql();
+        }
+    }
 
     return;
 }
@@ -164,9 +199,26 @@ sub _perform_postgresql_upgrade ($self) {
     local $ENV{PGSETUP_INITDB_OPTIONS} = join ' ', @args if scalar @args > 0;
 
     INFO("Upgrading PostgreSQL data directory:");
-    my $capture = $self->ssystem_capture_output( { keep_env => 1 }, qw{/usr/bin/postgresql-setup --upgrade} );
+    my $outcome = $self->ssystem( { keep_env => 1 }, qw{/usr/bin/postgresql-setup --upgrade} );
 
-    # TODO: add final notification stating that custom configuration and authentication may need to be restored manually
+    if ( $outcome == 0 ) {
+
+        # TODO: add final notification stating that custom configuration and authentication may need to be restored manually
+    }
+    else {
+        ERROR("The upgrade attempt of the system PostgreSQL instance failed.");
+        $self->_give_up_on_postgresql();
+    }
+
+    return;
+}
+
+sub _re_enable_service_if_needed ($self) {
+    return if $self->_gave_up_on_postgresql;    # keep disabled if there was a failure
+
+    if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_in_sm', 0 ) ) {
+        Cpanel::Services::Enabled::remove_disable_files('postgresql');
+    }
 
     return;
 }
@@ -177,20 +229,22 @@ sub _run_whostmgr_postgres_update_config ($self) {
 
     INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
     $self->service->start();    # PostgreSQL *must* be online for this to work
-    return Whostmgr::Postgres::update_config();
-}
 
-sub _re_enable_service_if_needed ($self) {
-    return if $self->_gave_up_on_postgresql;
+    if ( $self->service->is_active ) {
+        my ( $success, $msg ) = Whostmgr::Postgres::update_config();
+        ERROR("The system failed to update the PostgreSQL configuration: $msg") unless $success;
+    }
+    else {
+        ERROR("PostgreSQL was unable to start after its upgrade; the system could not configure it to work with cPanel.");
 
-    if ( Elevate::StageFile::read_stage_file( 're-enable_postgresql_in_sm', 0 ) ) {
-        Cpanel::Services::Enabled::remove_disable_files('postgresql');
+        # TODO: final notification
     }
 
     return;
 }
 
 sub _give_up_on_postgresql ($self) {
+    ERROR('Skipping attempt to upgrade the system instance of PostgreSQL.');
     Elevate::StageFile::update_stage_file( { postgresql_give_up => 1 } );
     return;
 }

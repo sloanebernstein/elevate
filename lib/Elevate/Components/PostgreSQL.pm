@@ -15,6 +15,7 @@ use Simple::Accessor qw{service};
 use parent qw{Elevate::Components::Base};
 
 use Elevate::Constants        ();
+use Elevate::Notify           ();
 use Elevate::StageFile        ();
 use Elevate::SystemctlService ();
 
@@ -32,8 +33,6 @@ sub _build_service ($self) {
     return Elevate::SystemctlService->new( name => 'postgresql' );
 }
 
-# installed
-
 sub pre_leapp ($self) {
     if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
         $self->_store_postgresql_encoding_and_locale();
@@ -49,9 +48,11 @@ sub _store_postgresql_encoding_and_locale ($self) {
 
     return if $self->_gave_up_on_postgresql;    # won't hurt
 
+    INFO("Fetching encoding and locale information from PostgreSQL.");
+
     my $is_active_prior = $self->service->is_active;
 
-    $self->service->start();                    # short-circuits if already active
+    $self->service->start();
 
     if ( $self->service->is_active ) {
         my $psql_sro = Cpanel::SafeRun::Object->new(
@@ -64,7 +65,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
 
         if ( $psql_sro->CHILD_ERROR ) {
             ERROR("The system instance of PostgreSQL did not return information about the encoding and locale of core databases.");
-            $self->_give_up_on_postgresql();
+            ERROR("ELevate will assume the system defaults and attempt an upgrade anyway.");
             return;
         }
 
@@ -86,6 +87,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
     }
     else {
         ERROR("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
+        ERROR("ELevate will assume the system defaults and attempt an upgrade anyway.");
         $self->_give_up_on_postgresql();
     }
 
@@ -103,7 +105,7 @@ sub _disable_postgresql_service ($self) {
     return;
 }
 
-# TODO: What happens if this runs out of disk space? Other error checking too.
+# TODO: What happens if this runs out of disk space? Should we check first?
 # XXX Is this really better than `cp -a $src $dst`? I hope nothing in there is owned by someone other than the postgres user...
 sub _backup_postgresql_datadir ($self) {
 
@@ -112,12 +114,10 @@ sub _backup_postgresql_datadir ($self) {
     my $pgsql_datadir_path        = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR;
     my $pgsql_datadir_backup_path = $pgsql_datadir_path . '_elevate_' . time() . '_' . $$;
 
-    # TODO: add final notification elaborating on this
     INFO("Backing up the system PostgreSQL data directory at $pgsql_datadir_path to $pgsql_datadir_backup_path.");
 
-    # Set EUID/EGID to postgres for the rest of this function (this is not security critical; it's just to retain correct ownership within copy):
+    # Set EUID/EGID to postgres (this is not security critical; it's just to retain correct ownership within copy):
     my ( $uid, $gid ) = ( scalar( getpwnam('postgres') ), scalar( getgrnam('postgres') ) );
-
     my $outcome = 0;
     {
         local ( $>, $) ) = ( $uid, "$gid $gid" );
@@ -127,6 +127,13 @@ sub _backup_postgresql_datadir ($self) {
     if ( !$outcome ) {
         ERROR("The system encountered an error while trying to make a backup.");
         $self->_give_up_on_postgresql();
+    }
+    else {
+        Elevate::Notify::add_final_notification( <<~"EOS" );
+        ELevate backed up your system PostgreSQL data directory to $pgsql_datadir_backup_path
+        prior to any modification or attempt to upgrade, in case the upgrade needs to be performed
+        manually, or if old settings need to be referenced.
+        EOS
     }
 
     return;
@@ -183,7 +190,6 @@ sub _perform_config_workaround ($self) {
     return;
 }
 
-# TODO: error handling?
 sub _perform_postgresql_upgrade ($self) {
     return if $self->_gave_up_on_postgresql;
 
@@ -199,14 +205,20 @@ sub _perform_postgresql_upgrade ($self) {
     local $ENV{PGSETUP_INITDB_OPTIONS} = join ' ', @args if scalar @args > 0;
 
     INFO("Upgrading PostgreSQL data directory:");
-    my $outcome = $self->ssystem( { keep_env => 1 }, qw{/usr/bin/postgresql-setup --upgrade} );
+    my $outcome = $self->ssystem( { keep_env => ( scalar @args > 0 ? 1 : 0 ) }, qw{/usr/bin/postgresql-setup --upgrade} );
 
     if ( $outcome == 0 ) {
-
-        # TODO: add final notification stating that custom configuration and authentication may need to be restored manually
+        INFO("The PostgreSQL upgrade process was successful.");
+        Elevate::Notify::add_final_notification( <<~EOS );
+        ELevate successfully ran the upgrade procedure on the system instance of
+        PostgreSQL. If no problems are reported with configuring the upgraded instance
+        to work with cPanel, you should proceed with applying any relevant
+        customizations to the configuration and authentication settings, since the
+        upgrade process reset this information to system defaults.
+        EOS
     }
     else {
-        ERROR("The upgrade attempt of the system PostgreSQL instance failed.");
+        ERROR("The upgrade attempt of the system PostgreSQL instance failed. See the log files mentioned in the output of postgresql-setup for more information.");
         $self->_give_up_on_postgresql();
     }
 
@@ -223,21 +235,27 @@ sub _re_enable_service_if_needed ($self) {
     return;
 }
 
-# TODO: return values
 sub _run_whostmgr_postgres_update_config ($self) {
     return if $self->_gave_up_on_postgresql;
 
     INFO("Configuring PostgreSQL to work with cPanel's installation of phpPgAdmin.");
-    $self->service->start();    # PostgreSQL *must* be online for this to work
+    $self->service->start();    # less noisy when it's online, but still works
 
-    if ( $self->service->is_active ) {
-        my ( $success, $msg ) = Whostmgr::Postgres::update_config();
-        ERROR("The system failed to update the PostgreSQL configuration: $msg") unless $success;
-    }
-    else {
-        ERROR("PostgreSQL was unable to start after its upgrade; the system could not configure it to work with cPanel.");
+    my ( $success, $msg ) = Whostmgr::Postgres::update_config();
+    if (!$success) {
+        ERROR("The system failed to update the PostgreSQL configuration: $msg");
+        Elevate::Notify::add_final_notification( <<~EOS );
+        ELevate was unable to configure the upgraded system PostgreSQL instance to work
+        with cPanel. See the log for additional information. Once the issue has been
+        addressed, perform this step manually using the "Postgres Config Install" area
+        in WHM:
 
-        # TODO: final notification
+        https://go.cpanel.net/whmdocsConfigurePostgreSQL
+
+        Do this before restoring any customizations to PostgreSQL configuration or
+        authentication files, since performing this action resets these to cPanel
+        defaults.
+        EOS
     }
 
     return;
@@ -246,6 +264,16 @@ sub _run_whostmgr_postgres_update_config ($self) {
 sub _give_up_on_postgresql ($self) {
     ERROR('Skipping attempt to upgrade the system instance of PostgreSQL.');
     Elevate::StageFile::update_stage_file( { postgresql_give_up => 1 } );
+    Elevate::Notify::add_final_notification( <<~EOS );
+    The process of upgrading the system instance of PostgreSQL failed. The
+    PostgreSQL service has been disabled in the Service Manager in WHM:
+
+    https://go.cpanel.net/whmdocsServiceManager
+
+    If you do not have cPanel users who use PostgreSQL or otherwise do not use it,
+    you do not have to take any action. Otherwise, see the ELevate logs for further
+    information.
+    EOS
     return;
 }
 

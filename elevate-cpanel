@@ -5121,8 +5121,8 @@ EOS
             );
 
             if ( $psql_sro->CHILD_ERROR ) {
-                ERROR("The system instance of PostgreSQL did not return information about the encoding and locale of core databases.");
-                ERROR("ELevate will assume the system defaults and attempt an upgrade anyway.");
+                WARN("The system instance of PostgreSQL did not return information about the encoding and locale of core databases.");
+                WARN("ELevate will assume the system defaults and attempt an upgrade anyway.");
                 return;
             }
 
@@ -5140,12 +5140,11 @@ EOS
                 }
             );
 
-            $self->service_stop() unless $is_active_prior;
+            $self->service->stop() unless $is_active_prior;
         }
         else {
-            ERROR("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
-            ERROR("ELevate will assume the system defaults and attempt an upgrade anyway.");
-            $self->_give_up_on_postgresql();
+            WARN("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
+            WARN("ELevate will assume the system defaults and attempt an upgrade anyway.");
         }
 
         return;
@@ -5209,8 +5208,6 @@ EOS
         my $pgconf_path = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf';
         return unless -e $pgconf_path;    # if postgresql.conf isn't there, there's nothing to work around
 
-        INFO("Modifying $pgconf_path to work around a defect in the system's PostgreSQL upgrade package.");
-
         my $pgconf = eval { File::Slurper::read_text($pgconf_path) };
         if ($@) {
             ERROR("Attempting to read $pgconf_path resulted in an error: $@");
@@ -5230,6 +5227,8 @@ EOS
 
         if ($changed) {
             push @lines, "unix_socket_directory = '/var/run/postgresql'";
+
+            INFO("Modifying $pgconf_path to work around a defect in the system's PostgreSQL upgrade package.");
 
             my $pgconf_altered = join "\n", @lines;
             eval { File::Slurper::write_text( $pgconf_path, $pgconf_altered ) };

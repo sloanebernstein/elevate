@@ -6,6 +6,14 @@ package Elevate::Components::PostgreSQL;
 
 Elevate::Components::PostgreSQL
 
+=head1 DESCRIPTION
+
+Upgrades the system PostgreSQL instance.
+
+This is considered to be a best-effort task: if something fails in an expected
+way, it will emit errors and notify the user but will B<not> terminate the
+ELevate process or otherwise cause it to be considered an overall failure.
+
 =cut
 
 use cPstrict;
@@ -33,6 +41,12 @@ sub _build_service ($self) {
     return Elevate::SystemctlService->new( name => 'postgresql' );
 }
 
+=head1 BEFORE LEAPP
+
+=over
+
+=cut
+
 sub pre_leapp ($self) {
     if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
         $self->_store_postgresql_encoding_and_locale();
@@ -43,7 +57,14 @@ sub pre_leapp ($self) {
     return;
 }
 
-# PostgreSQL needs to be up to get this information:
+=item _store_postgresql_encoding_and_locale
+
+Fetch and record the encoding and immutable locale data of the C<template1>
+database. This information is needed later to avoid RE-637. If this process
+fails, something is probably wrong, but keep going anyway.
+
+=cut
+
 sub _store_postgresql_encoding_and_locale ($self) {
 
     return if $self->_gave_up_on_postgresql;    # won't hurt
@@ -52,6 +73,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
 
     my $is_active_prior = $self->service->is_active;
 
+    # PostgreSQL needs to be up to get this information:
     $self->service->start();
 
     if ( $self->service->is_active ) {
@@ -64,8 +86,8 @@ sub _store_postgresql_encoding_and_locale ($self) {
         );
 
         if ( $psql_sro->CHILD_ERROR ) {
-            ERROR("The system instance of PostgreSQL did not return information about the encoding and locale of core databases.");
-            ERROR("ELevate will assume the system defaults and attempt an upgrade anyway.");
+            WARN("The system instance of PostgreSQL did not return information about the encoding and locale of core databases.");
+            WARN("ELevate will assume the system defaults and attempt an upgrade anyway.");
             return;
         }
 
@@ -83,20 +105,27 @@ sub _store_postgresql_encoding_and_locale ($self) {
             }
         );
 
-        $self->service_stop() unless $is_active_prior;
+        $self->service->stop() unless $is_active_prior;
     }
     else {
-        ERROR("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
-        ERROR("ELevate will assume the system defaults and attempt an upgrade anyway.");
-        $self->_give_up_on_postgresql();
+        WARN("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
+        WARN("ELevate will assume the system defaults and attempt an upgrade anyway.");
     }
 
     return;
 }
 
+=item _disable_postgresql_service
+
+Touches the file needed to get Service Manager to believe that PostgreSQL is
+disabled. If the service is enabled, then upcp fails during the post-leapp
+phase of the RpmDB component. Also doubles as the mechanism by which PostgreSQL
+is disabled on a system where a step prior to the upgrade fails.
+
+=cut
+
 sub _disable_postgresql_service ($self) {
 
-    # If the service is enabled in Service Manager, then upcp fails during post-leapp phase of the RpmDB component:
     if ( Cpanel::Services::Enabled::is_enabled('postgresql') ) {
         Elevate::StageFile::update_stage_file( { 're-enable_postgresql_in_sm' => 1 } );
         Cpanel::Services::Enabled::touch_disable_file('postgresql');
@@ -105,7 +134,14 @@ sub _disable_postgresql_service ($self) {
     return;
 }
 
-# TODO: What happens if this runs out of disk space? Should we check first?
+=item _backup_postgresql_datadir
+
+While the user should have backed up their system, as a convenience and assurance, take our own backup.
+
+TODO: What happens if this runs out of disk space? Should we check first?
+
+=cut
+
 # XXX Is this really better than `cp -a $src $dst`? I hope nothing in there is owned by someone other than the postgres user...
 sub _backup_postgresql_datadir ($self) {
 
@@ -139,6 +175,14 @@ sub _backup_postgresql_datadir ($self) {
     return;
 }
 
+=back
+
+=head1 AFTER LEAPP
+
+=over
+
+=cut
+
 sub post_leapp ($self) {
     if ( Cpanel::Pkgr::is_installed('postgresql-server') ) {
         $self->_perform_config_workaround();
@@ -150,13 +194,23 @@ sub post_leapp ($self) {
     return;
 }
 
+=item _perform_config_workaround
+
+There is a bug with the EL8 postgresql-upgrade package, namely that the support
+for the C<unix_socket_directories> configuration directive which was
+back-ported from 9.3 into the 9.2 package for EL7 is not being applied to the
+version of 9.2 being built to support the upgrade. For this reason, we need to
+alter the existing F<postgresql.conf> file to comment out any
+C<unix_socket_directories> directives and add a standard
+C<unix_socket_directory> directive at the end instead.
+
+=cut
+
 sub _perform_config_workaround ($self) {
     return if $self->_gave_up_on_postgresql;
 
     my $pgconf_path = Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf';
     return unless -e $pgconf_path;    # if postgresql.conf isn't there, there's nothing to work around
-
-    INFO("Modifying $pgconf_path to work around a defect in the system's PostgreSQL upgrade package.");
 
     my $pgconf = eval { File::Slurper::read_text($pgconf_path) };
     if ($@) {
@@ -178,6 +232,8 @@ sub _perform_config_workaround ($self) {
     if ($changed) {
         push @lines, "unix_socket_directory = '/var/run/postgresql'";
 
+        INFO("Modifying $pgconf_path to work around a defect in the system's PostgreSQL upgrade package.");
+
         my $pgconf_altered = join "\n", @lines;
         eval { File::Slurper::write_text( $pgconf_path, $pgconf_altered ) };
 
@@ -189,6 +245,14 @@ sub _perform_config_workaround ($self) {
 
     return;
 }
+
+=item _perform_postgresql_upgrade
+
+Performs the upgrade using the EL-provided C<postgresql-setup --upgrade>
+script. If encoding and locale data were collected in the pre-leapp phase, use
+them here when provisioning the new cluster.
+
+=cut
 
 sub _perform_postgresql_upgrade ($self) {
     return if $self->_gave_up_on_postgresql;
@@ -225,6 +289,12 @@ sub _perform_postgresql_upgrade ($self) {
     return;
 }
 
+=item _re_enable_service_if_needed
+
+If the upgrade was successful, and we disabled the PostgreSQL service in Service Manager, re-enable the service now.
+
+=cut
+
 sub _re_enable_service_if_needed ($self) {
     return if $self->_gave_up_on_postgresql;    # keep disabled if there was a failure
 
@@ -235,6 +305,17 @@ sub _re_enable_service_if_needed ($self) {
     return;
 }
 
+=item _run_whostmgr_postgres_update_config
+
+The upgrade completely reset the PostgreSQL configuration and authentication
+methods, so this is the ideal time to invoke the WHM code to correctly
+configure this for use with phpPgAdmin in cPanel.
+
+This process happens I<after> the upgrade, so a failure here probably should
+B<not> result in skipping following steps, if any are added in the future.
+
+=cut
+
 sub _run_whostmgr_postgres_update_config ($self) {
     return if $self->_gave_up_on_postgresql;
 
@@ -242,7 +323,7 @@ sub _run_whostmgr_postgres_update_config ($self) {
     $self->service->start();    # less noisy when it's online, but still works
 
     my ( $success, $msg ) = Whostmgr::Postgres::update_config();
-    if (!$success) {
+    if ( !$success ) {
         ERROR("The system failed to update the PostgreSQL configuration: $msg");
         Elevate::Notify::add_final_notification( <<~EOS );
         ELevate was unable to configure the upgraded system PostgreSQL instance to work
@@ -261,6 +342,18 @@ sub _run_whostmgr_postgres_update_config ($self) {
     return;
 }
 
+=back
+
+=head1 UTILITY METHODS
+
+=over
+
+=item _give_up_on_postgresql
+
+Invoke when all subsequent steps of the PostgreSQL upgrade should be skipped due to a failure.
+
+=cut
+
 sub _give_up_on_postgresql ($self) {
     ERROR('Skipping attempt to upgrade the system instance of PostgreSQL.');
     Elevate::StageFile::update_stage_file( { postgresql_give_up => 1 } );
@@ -277,6 +370,14 @@ sub _give_up_on_postgresql ($self) {
     return;
 }
 
+=item _gave_up_on_postgresql
+
+=item _given_up_on_postgresql
+
+Returns true if an error has prompted us to skip the upgrade.
+
+=cut
+
 sub _gave_up_on_postgresql ($self) {
     return Elevate::StageFile::read_stage_file( 'postgresql_give_up', 0 );
 }
@@ -285,5 +386,9 @@ sub _gave_up_on_postgresql ($self) {
 sub _given_up_on_postgresql {
     goto &_gave_up_on_postgresql;
 }
+
+=back
+
+=cut
 
 1;

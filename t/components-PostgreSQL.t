@@ -81,7 +81,7 @@ $mock_pkgr->redefine(
 
     $installed = 1;
 
-    my $mock_pg_conf = Test::MockFile->file(Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf');
+    my $mock_pg_conf = Test::MockFile->file( Elevate::Constants::POSTGRESQL_SYSTEM_DATADIR . '/postgresql.conf' );
 
     $mock_pg_conf->contents("no matches");
     $comp_pgsql->_perform_config_workaround();

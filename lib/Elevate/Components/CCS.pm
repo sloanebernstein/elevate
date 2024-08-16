@@ -415,13 +415,12 @@ sub _import_data_for_single_user ( $self, $user ) {
 
 =head1 move_pgsql_directory
 
-Due to the fact that CCS re-uses scripts originally intended for use with the
-system Postgres, leaving the system Postgres data directory in place sometimes
-results in failure to apply schema updates to CCS, causing failures in
-importing user data. This is technically a bug in CCS, but we will not be
-issuing a fix for that. Instead, when needed, the system Postgres database
-shall be moved aside, ensuring that all and only CCS processes apply to that
-instance of Postgres.
+Because CCS re-uses scripts originally intended for use with the system
+Postgres, leaving the system Postgres data directory in place sometimes results
+in failure to apply schema updates to CCS, causing failures in importing user
+data. This is technically a bug in CCS, but we will not be issuing a fix for
+that. Instead, when needed, the system Postgres database shall be moved aside,
+ensuring that all and only CCS processes apply to that instance of Postgres.
 
 =cut
 

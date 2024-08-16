@@ -108,7 +108,7 @@ sub _store_postgresql_encoding_and_locale ($self) {
         $self->service->stop() unless $is_active_prior;
     }
     else {
-        WARN("The system instance of PostgreSQL was unable to start to give information about the encoding and locale of core databases.");
+        WARN("The system instance of PostgreSQL could not start to give information about the encoding and locale of core databases.");
         WARN("ELevate will assume the system defaults and attempt an upgrade anyway.");
     }
 
@@ -326,7 +326,7 @@ sub _run_whostmgr_postgres_update_config ($self) {
     if ( !$success ) {
         ERROR("The system failed to update the PostgreSQL configuration: $msg");
         Elevate::Notify::add_final_notification( <<~EOS );
-        ELevate was unable to configure the upgraded system PostgreSQL instance to work
+        ELevate could not configure the upgraded system PostgreSQL instance to work
         with cPanel. See the log for additional information. Once the issue has been
         addressed, perform this step manually using the "Postgres Config Install" area
         in WHM:

@@ -20,6 +20,8 @@ use Try::Tiny;
 use File::Path ();
 use File::Copy ();
 
+use Capture::Tiny ();
+
 use Cpanel::Autodie       ();
 use Cpanel::Config::Users ();
 use Cpanel::JSON          ();
@@ -401,7 +403,7 @@ sub _import_data_for_single_user ( $self, $user ) {
     };
 
     try {
-        CCSHooks::pkgacct_restore( undef, $import_data );
+        DEBUG( scalar Capture::Tiny::capture_stdout( sub { CCSHooks::pkgacct_restore( undef, $import_data ) } ) );
     }
     catch {
         my $err = $_;

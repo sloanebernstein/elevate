@@ -2694,6 +2694,8 @@ EOS
     use File::Path ();
     use File::Copy ();
 
+    use Capture::Tiny ();
+
     use Cpanel::Autodie       ();
     use Cpanel::Config::Users ();
     use Cpanel::JSON          ();
@@ -3034,7 +3036,7 @@ EOS
         };
 
         try {
-            CCSHooks::pkgacct_restore( undef, $import_data );
+            DEBUG( scalar Capture::Tiny::capture_stdout( sub { CCSHooks::pkgacct_restore( undef, $import_data ) } ) );
         }
         catch {
             my $err = $_;
